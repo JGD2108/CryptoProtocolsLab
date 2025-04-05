@@ -3,6 +3,11 @@ import socket
 import threading
 import random
 import json
+import os
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+from Cryptodome.Cipher import ChaCha20
+import json
+from base64 import b64encode, b64decode
 
 class ChatServer:
     def __init__(self, host='localhost', port=8888):
@@ -17,9 +22,10 @@ class ChatServer:
         self.p = list()
         self.q = list()
         self.g = list()
-        self.escenario_seleccionado = 0  # Parámetros DH
+        self.escenario_seleccionado = 0  # Parámetros Diffie Hellman
         self.modo_comunicacion = 1  # 1: Diffie-Hellman, 2 y 3: otros modos
         self.secreto_compartido = None
+        self.key = None  # Clave simétrica para cifrado
     
     def inicializar_socket(self):
         """Configura el socket del servidor."""
@@ -34,9 +40,13 @@ class ChatServer:
         while self.activo:
             try:
                 # Recibir mensaje del cliente
-                mensaje = cliente_socket.recv(1024).decode('utf-8')
+                mensaje = cliente_socket.recv(1024)
                 if not mensaje:
                     break
+                
+                if self.modo_comunicacion==1:
+                   mensaje = self.decipherChacha20(self.key, mensaje)
+                    
                     
                 print(f"Mensaje recibido de {direccion}: {mensaje}")
                 # No respondemos automáticamente, el hilo de envío se encargará de eso
@@ -71,7 +81,9 @@ class ChatServer:
         # Usamos una copia de la lista para evitar problemas si se modifica durante el bucle
         for cliente in self.clientes[:]:  
             try:
-                cliente.send(mensaje.encode('utf-8'))
+                if self.modo_comunicacion==1:
+                    mensaje = self.encypherChacha20(self.key, mensaje)
+                cliente.send(mensaje)
             except:
                 # Si hay error al enviar, el cliente probablemente se desconectó
                 self.desconectar_cliente(cliente)
@@ -84,6 +96,43 @@ class ChatServer:
             cliente_socket.close()
         except:
             pass  # Ignorar errores al cerrar el socket
+    
+    def KDF(self, secreto, salt):
+        secreto = str(secreto).encode('utf-8')
+        kdf = Argon2id(
+            salt=salt,
+            length=32,
+            iterations=1,
+            lanes=4,
+            memory_cost=64 * 1024,
+            ad=None,
+            secret=None,
+        )
+        key = kdf.derive(secreto)
+        return key
+    
+    def encypherChacha20(self, key, msg):
+        cipher = ChaCha20.new(key=key)
+        plaintext = msg.encode('utf-8')
+        ciphertext = cipher.encrypt(plaintext)
+        nonce = b64encode(cipher.nonce).decode('utf-8')
+        ct = b64encode(ciphertext).decode('utf-8')
+        result = json.dumps({'nonce': nonce, 'ciphertext': ct})
+        # Se mide hasta después de crear la cadena JSON
+        return result.encode('utf-8')
+    
+    def decipherChacha20(self, key, msg):
+        json_input = msg.decode('utf-8')
+        try:
+            b64 = json.loads(json_input)
+            nonce = b64decode(b64['nonce'])
+            ciphertext = b64decode(b64['ciphertext'])
+            cipher = ChaCha20.new(key=key, nonce=nonce)
+            plaintext = cipher.decrypt(ciphertext)
+        except (ValueError, KeyError):
+            print("Incorrect decryption")
+
+        return plaintext.decode('utf-8')
     
     def aceptar_conexiones(self):
         """Acepta nuevas conexiones de clientes."""
@@ -105,8 +154,12 @@ class ChatServer:
                         secreto = self.realizar_intercambio_diffie_hellman(cliente_socket, direccion)
                         if secreto:
                             print(f"Intercambio Diffie-Hellman completado con {direccion}. Secreto: {secreto}")
-                            self.clientes.append(cliente_socket)
-                            
+                            salt = os.urandom(16)
+                            salt_b64 = b64encode(salt).decode('utf-8')
+                            cliente_socket.send(f"SAL:{salt_b64}".encode('utf-8'))
+                            symetric_key = self.KDF(secreto, salt)
+                            self.key = symetric_key
+                            self.clientes.append(cliente_socket)  # Agregar cliente a la lista
                             # Crear un hilo para la recepción continua 
                             hilo_cliente = threading.Thread(
                                 target=self.recibir_mensajes, 
@@ -166,32 +219,28 @@ class ChatServer:
                     # Si es Diffie-Hellman, también seleccionar escenario
                     if modo == 1:
                         self.seleccionar_escenario_diffie_hellman()
+                                    # Inicializar socket y activar servidor
+                        self.inicializar_socket()
+                        self.activo = True
+                        
+                       
+                        
+                        # Crear e iniciar el hilo para aceptar conexiones
+                        self.hilo_aceptacion = threading.Thread(target=self.aceptar_conexiones)
+                        self.hilo_aceptacion.daemon = True
+                        self.hilo_aceptacion.start()
+                        
+                         # Crear e iniciar el hilo para enviar mensajes
+                        self.hilo_envio = threading.Thread(target=self.enviar_mensajes)
+                        self.hilo_envio.daemon = True
+                        self.hilo_envio.start()
+                        
+                        # Mantener el hilo principal vivo hasta que termine el hilo de envío
+                        self.hilo_envio.join()
                 else:
                     print("Número fuera de rango. Usando modo 1 (Diffie-Hellman) por defecto.")
-                    self.modo_comunicacion = 1
-                    self.seleccionar_escenario_diffie_hellman()
             except ValueError:
                 print("Entrada inválida. Usando modo 1 (Diffie-Hellman) por defecto.")
-                self.modo_comunicacion = 1
-                self.seleccionar_escenario_diffie_hellman()
-            
-            # Inicializar socket y activar servidor
-            self.inicializar_socket()
-            self.activo = True
-            
-            # Crear e iniciar el hilo para enviar mensajes
-            self.hilo_envio = threading.Thread(target=self.enviar_mensajes)
-            self.hilo_envio.daemon = True
-            self.hilo_envio.start()
-            
-            # Crear e iniciar el hilo para aceptar conexiones
-            self.hilo_aceptacion = threading.Thread(target=self.aceptar_conexiones)
-            self.hilo_aceptacion.daemon = True
-            self.hilo_aceptacion.start()
-            
-            # Mantener el hilo principal vivo hasta que termine el hilo de envío
-            self.hilo_envio.join()
-            
         except KeyboardInterrupt:
             print("Servidor detenido")
             self.activo = False

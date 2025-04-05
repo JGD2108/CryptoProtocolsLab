@@ -4,6 +4,9 @@ import threading
 import time
 import random
 import json
+from Cryptodome.Cipher import ChaCha20
+from base64 import b64encode, b64decode
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
 class ChatClient:
     def __init__(self, host='localhost', port=8888):
@@ -20,6 +23,7 @@ class ChatClient:
         self.escenario_seleccionado = 0
         self.modo_comunicacion = 1  # Por defecto Diffie-Hellman
         self.secreto_compartido = None
+        self.key = None
     
     def conectar(self):
         """Establece conexión con el servidor."""
@@ -49,18 +53,46 @@ class ChatClient:
         while self.conectado:
             try:
                 # Recibir mensaje del servidor
-                mensaje = self.socket.recv(1024).decode('utf-8')
+                mensaje = self.socket.recv(1024)
                 if not mensaje:
                     print("Conexión cerrada por el servidor")
                     self.conectado = False
                     break
                 
-                print(f"\nMensaje del servidor: {mensaje}")
+                if self.modo_comunicacion==1:
+                    try:
+                        mensaje = self.decipherChacha20(self.key, mensaje)
+                    except Exception as e:
+                        print(f"\nError al descifrar: {e}")
+                        mensaje = mensaje.decode('utf-8', errors='ignore')
+                else:
+                    mensaje = mensaje.decode('utf-8')
+                
+                # Borrar la línea actual del prompt (si hay)
+                print("\r", end="")
+                # Imprimir el mensaje recibido
+                print(f"\n>>> Mensaje del servidor: {mensaje}")
+                # Reprompt - volver a mostrar el prompt de entrada
+                print("Escribe un mensaje (o 'salir' para terminar): ", end="", flush=True)
                 
             except Exception as e:
                 print(f"\nError al recibir: {e}")
                 self.conectado = False
                 break
+            
+    def KDF(self, secreto, salt):
+        secreto = str(secreto).encode('utf-8')
+        kdf = Argon2id(
+            salt=salt,
+            length=32,
+            iterations=1,
+            lanes=4,
+            memory_cost=64 * 1024,
+            ad=None,
+            secret=None,
+        )
+        key = kdf.derive(secreto)
+        return key
     
     def enviar_mensajes(self):
         """Maneja el envío de mensajes al servidor."""
@@ -72,14 +104,37 @@ class ChatClient:
                 if mensaje.lower() == 'salir':
                     self.conectado = False
                     break
-                    
-                # Enviar mensaje al servidor
-                self.socket.send(mensaje.encode('utf-8'))
+                if self.modo_comunicacion==1:
+                    mensaje = self.encypherChacha20(self.key, mensaje)
+
+                self.socket.send(mensaje)
                 
             except Exception as e:
                 print(f"Error al enviar: {e}")
                 self.conectado = False
                 break
+            
+    def encypherChacha20(self, key, msg):
+        cipher = ChaCha20.new(key=key)
+        plaintext = msg.encode('utf-8')
+        ciphertext = cipher.encrypt(plaintext)
+        nonce = b64encode(cipher.nonce).decode('utf-8')
+        ct = b64encode(ciphertext).decode('utf-8')
+        result = json.dumps({'nonce': nonce, 'ciphertext': ct})
+        # Se mide hasta después de crear la cadena JSON
+        return result.encode('utf-8')
+    
+    def decipherChacha20(self, key, msg):
+        json_input = msg.decode('utf-8')
+        try:
+            b64 = json.loads(json_input)
+            nonce = b64decode(b64['nonce'])
+            ciphertext = b64decode(b64['ciphertext'])
+            cipher = ChaCha20.new(key=key, nonce=nonce)
+            plaintext = cipher.decrypt(ciphertext)
+        except (ValueError, KeyError):
+            print("Incorrect decryption")
+        return plaintext.decode('utf-8')
     
     def iniciar_hilos(self):
         """Inicia los hilos de envío y recepción."""
@@ -120,7 +175,15 @@ class ChatClient:
                 # Modo 1: Diffie-Hellman
                 if self.realizar_intercambio_diffie_hellman():
                     print(f"Intercambio Diffie-Hellman completado. Secreto compartido: {self.secreto_compartido}")
-                    print("Iniciando modo chat...")
+                    # recibir salt del servidor 
+                    salt_msg = self.socket.recv(1024).decode('utf-8')
+                    if salt_msg.startswith("SAL:"):
+                        salt_b64 = salt_msg.split(":")[1]
+                        salt = b64decode(salt_b64)
+                        print("Salt recibido del servidor")
+                        self.key = self.KDF(self.secreto_compartido, salt)
+                    else:
+                        print(f"Error: mensaje inesperado en lugar de salt: {salt_msg}")
                     
                     # Solo después de DH exitoso, iniciar hilos de chat
                     self.iniciar_hilos()
