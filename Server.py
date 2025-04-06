@@ -8,6 +8,11 @@ from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from Cryptodome.Cipher import ChaCha20
 import json
 from base64 import b64encode, b64decode
+from Cryptodome.Cipher import AES
+from Cryptodome.Util.Padding import pad
+from Cryptodome.Util.Padding import unpad
+
+
 
 class ChatServer:
     def __init__(self, host='localhost', port=8888):
@@ -22,10 +27,54 @@ class ChatServer:
         self.p = list()
         self.q = list()
         self.g = list()
-        self.escenario_seleccionado = 0  # Parámetros Diffie Hellman
-        self.modo_comunicacion = 1  # 1: Diffie-Hellman, 2 y 3: otros modos
+        self.escenario_seleccionado = None  # 1: Diffie-Hellman, 2 y 3: otros modos
+        self.modo_comunicacion = None  # Parámetros Diffie Hellman
         self.secreto_compartido = None
         self.key = None  # Clave simétrica para cifrado
+        self.HEADER = 64
+        self.FORMAT = 'utf-8'
+    
+    def recv_bytes(self, cliente_socket):
+        """Recibe bytes con formato de longitud desde un cliente."""
+        try:
+            msg_length = cliente_socket.recv(self.HEADER).decode(self.FORMAT)
+            if not msg_length:
+                return None
+                
+            msg_length = int(msg_length.strip())
+            data = cliente_socket.recv(msg_length)
+            return data
+        except Exception as e:
+            print(f"Error recibiendo bytes: {e}")
+            return None
+
+    # Modifica el método de recepción para el escenario 2
+    def recibir_mensajes(self, cliente_socket, direccion):
+        """Maneja la recepción de mensajes de un cliente específico."""
+        while self.activo:
+            try:
+                if self.escenario_seleccionado == 1:
+                    # Recibir mensaje del cliente
+                    mensaje = cliente_socket.recv(1024)
+                    if not mensaje:
+                        break
+                    mensaje = self.decipherChacha20(self.key, mensaje)
+                elif self.escenario_seleccionado == 2:
+                    # Usar el nuevo método para recibir bytes
+                    mensaje_cifrado = self.recv_bytes(cliente_socket)
+                    if not mensaje_cifrado:
+                        break
+                    mensaje = self.decipherAES192(self.key, mensaje_cifrado)
+                
+                print(f"Mensaje recibido de {direccion}: {mensaje}")
+                
+            except Exception as e:
+                print(f"Error con cliente {direccion}: {e}")
+                break
+        
+        # Cerrar conexión cuando hay error o el cliente se desconecta
+        self.desconectar_cliente(cliente_socket)
+        print(f"Cliente {direccion} desconectado")
     
     def inicializar_socket(self):
         """Configura el socket del servidor."""
@@ -44,9 +93,11 @@ class ChatServer:
                 if not mensaje:
                     break
                 
-                if self.modo_comunicacion==1:
+                if self.escenario_seleccionado==1:
                    mensaje = self.decipherChacha20(self.key, mensaje)
                     
+                elif self.escenario_seleccionado==2:
+                    mensaje = self.decipherAES192(self.key, mensaje)
                     
                 print(f"Mensaje recibido de {direccion}: {mensaje}")
                 # No respondemos automáticamente, el hilo de envío se encargará de eso
@@ -78,14 +129,20 @@ class ChatServer:
     
     def broadcast(self, mensaje):
         """Envía un mensaje a todos los clientes conectados."""
-        # Usamos una copia de la lista para evitar problemas si se modifica durante el bucle
         for cliente in self.clientes[:]:  
             try:
-                if self.modo_comunicacion==1:
-                    mensaje = self.encypherChacha20(self.key, mensaje)
-                cliente.send(mensaje)
+                if self.escenario_seleccionado == 1:
+                    mensaje_cifrado = self.encypherChacha20(self.key, mensaje)
+                    cliente.send(mensaje_cifrado)
+                elif self.escenario_seleccionado == 2:
+                    mensaje_cifrado = self.cipherAES192(self.key, mensaje)
+                    # Enviar usando el formato de longitud
+                    msg_length = len(mensaje_cifrado)
+                    send_length = str(msg_length).encode(self.FORMAT)
+                    send_length += b' ' * (self.HEADER - len(send_length))
+                    cliente.send(send_length)
+                    cliente.send(mensaje_cifrado)
             except:
-                # Si hay error al enviar, el cliente probablemente se desconectó
                 self.desconectar_cliente(cliente)
     
     def desconectar_cliente(self, cliente_socket):
@@ -99,16 +156,29 @@ class ChatServer:
     
     def KDF(self, secreto, salt):
         secreto = str(secreto).encode('utf-8')
-        kdf = Argon2id(
-            salt=salt,
-            length=32,
-            iterations=1,
-            lanes=4,
-            memory_cost=64 * 1024,
-            ad=None,
-            secret=None,
-        )
-        key = kdf.derive(secreto)
+        if self.escenario_seleccionado==1:
+         
+            kdf = Argon2id(
+                salt=salt,
+                length=32,
+                iterations=1,
+                lanes=4,
+                memory_cost=64 * 1024,
+                ad=None,
+                secret=None,
+            )
+            key = kdf.derive(secreto)
+        elif self.escenario_seleccionado==2:
+            kdf = Argon2id(
+                salt=salt,
+                length=24,
+                iterations=1,
+                lanes=4,
+                memory_cost=64 * 1024,
+                ad=None,
+                secret=None,
+            )
+            key = kdf.derive(secreto)
         return key
     
     def encypherChacha20(self, key, msg):
@@ -133,6 +203,27 @@ class ChatServer:
             print("Incorrect decryption")
 
         return plaintext.decode('utf-8')
+
+    def cipherAES192(self, key, data):
+        user_input = user_input.encode("utf-8")
+        cipher = AES.new(key, AES.MODE_CBC)
+        ct_bytes = cipher.encrypt(pad(user_input, AES.block_size))
+        iv = b64encode(cipher.iv).decode('utf-8')
+        ct = b64encode(ct_bytes).decode('utf-8')
+        result = json.dumps({'iv':iv, 'ciphertext':ct})
+        return result.encode('utf-8')  # Convert to bytes
+
+    def decipherAES192(self, key, json_input):
+        try:
+            b64 = json.loads(json_input)
+            iv = b64decode(b64['iv'])
+            ct = b64decode(b64['ciphertext'])
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            pt = unpad(cipher.decrypt(ct), AES.block_size)
+            return pt.decode('utf-8')  # Return the decoded message
+        except (ValueError, KeyError):
+            print("Incorrect decryption")
+            return None
     
     def aceptar_conexiones(self):
         """Acepta nuevas conexiones de clientes."""
@@ -144,12 +235,12 @@ class ChatServer:
                     cliente_socket, direccion = self.socket.accept()
                     print(f"Nueva conexión de {direccion}")
                     
-                    # Enviar el modo de comunicación seleccionado al cliente
-                    cliente_socket.send(f"MODO:{self.modo_comunicacion}".encode('utf-8'))
-                    print(f"Enviado modo de comunicación {self.modo_comunicacion} al cliente")
+                    # Enviar el escenario seleccionado al cliente
+                    cliente_socket.send(f"Escenario:{self.escenario_seleccionado}".encode('utf-8'))
+                    print(f"Enviado modo de comunicación {self.escenario_seleccionado} al cliente")
                     
                     # Manejar según el modo de comunicación seleccionado
-                    if self.modo_comunicacion == 1:
+                    if self.escenario_seleccionado == 1:
                         # Modo 1: Diffie-Hellman
                         secreto = self.realizar_intercambio_diffie_hellman(cliente_socket, direccion)
                         if secreto:
@@ -171,15 +262,30 @@ class ChatServer:
                             print(f"Fallo en intercambio Diffie-Hellman con {direccion}")
                             cliente_socket.close()
                             
-                    elif self.modo_comunicacion == 2:
-                        # Modo 2: Placeholder para otro protocolo
-                        print("Usando modo de comunicación 2")
-                        self.manejar_modo_comunicacion_2(cliente_socket, direccion)
+                    elif self.escenario_seleccionado == 2:
+                        secreto = self.realizar_intercambio_diffie_hellman(cliente_socket, direccion)
+                        if secreto:
+                            print(f"Intercambio Diffie-Hellman completado con {direccion}. Secreto: {secreto}")
+                            salt = os.urandom(16)
+                            salt_b64 = b64encode(salt).decode('utf-8')
+                            cliente_socket.send(f"SAL:{salt_b64}".encode('utf-8'))
+                            symetric_key = self.KDF(secreto[0], salt)
+                            self.key = symetric_key
+                            self.clientes.append(cliente_socket)  # Agregar cliente a la lista
+                            # Crear un hilo para la recepción continua 
+                            hilo_cliente = threading.Thread(
+                                target=self.recibir_mensajes, 
+                                args=(cliente_socket, direccion)
+                            )
+                            hilo_cliente.daemon = True
+                            hilo_cliente.start()
                         
-                    elif self.modo_comunicacion == 3:
+
+                        
+                    elif self.escenario_seleccionado == 3:
                         # Modo 3: Placeholder para otro protocolo
                         print("Usando modo de comunicación 3")
-                        self.manejar_modo_comunicacion_3(cliente_socket, direccion)
+                        self.manejar_escenario3(cliente_socket, direccion)
                         
                     else:
                         print(f"Modo de comunicación desconocido: {self.modo_comunicacion}")
@@ -195,14 +301,6 @@ class ChatServer:
         
         print("Cerrando el servidor...")
     
-    def manejar_modo_comunicacion_2(self, cliente_socket, direccion):
-        """Maneja el segundo modo de comunicación (placeholder)."""
-        pass  # Implementar el segundo modo de comunicación aquí
-    
-    def manejar_modo_comunicacion_3(self, cliente_socket, direccion):
-        """Maneja el tercer modo de comunicación (placeholder)."""
-        pass  # Implementar el tercer modo de comunicación aquí
-    
     def iniciar(self):
         """Inicia el servidor y todos sus hilos."""
         try:
@@ -211,32 +309,29 @@ class ChatServer:
             
             # Seleccionar modo de comunicación
             try:
-                modo = int(input("Ingrese el modo de comunicación (1: Diffie-Hellman, 2: Modo 2, 3: Modo 3): "))
-                if 1 <= modo <= 3:
-                    self.modo_comunicacion = modo
-                    print(f"Usando modo de comunicación {modo}")
+                self.escenario_seleccionado = int(input("Ingrese el Escenario (Escenario 1: Diffie-Hellman, Escenario 2: Modo 2, Escenario 3: Modo 3): "))
+                if 1 <= self.escenario_seleccionado <= 3:
+                    print(f"Usando Escenario {self.escenario_seleccionado}")
                     
                     # Si es Diffie-Hellman, también seleccionar escenario
-                    if modo == 1:
-                        self.seleccionar_escenario_diffie_hellman()
+                    if self.escenario_seleccionado == 1:
+                        self.seleccionar_combinacion_diffie_hellman()
                                     # Inicializar socket y activar servidor
-                        self.inicializar_socket()
-                        self.activo = True
-                        
-                       
-                        
-                        # Crear e iniciar el hilo para aceptar conexiones
-                        self.hilo_aceptacion = threading.Thread(target=self.aceptar_conexiones)
-                        self.hilo_aceptacion.daemon = True
-                        self.hilo_aceptacion.start()
-                        
-                         # Crear e iniciar el hilo para enviar mensajes
-                        self.hilo_envio = threading.Thread(target=self.enviar_mensajes)
-                        self.hilo_envio.daemon = True
-                        self.hilo_envio.start()
-                        
-                        # Mantener el hilo principal vivo hasta que termine el hilo de envío
-                        self.hilo_envio.join()
+                    self.inicializar_socket()
+                    self.activo = True
+                    # Crear e iniciar el hilo para aceptar conexiones
+                    self.hilo_aceptacion = threading.Thread(target=self.aceptar_conexiones)
+                    self.hilo_aceptacion.daemon = True
+                    self.hilo_aceptacion.start()
+                    
+                        # Crear e iniciar el hilo para enviar mensajes
+                    self.hilo_envio = threading.Thread(target=self.enviar_mensajes)
+                    self.hilo_envio.daemon = True
+                    self.hilo_envio.start()
+                    
+                    # Mantener el hilo principal vivo hasta que termine el hilo de envío
+                    self.hilo_envio.join()
+                
                 else:
                     print("Número fuera de rango. Usando modo 1 (Diffie-Hellman) por defecto.")
             except ValueError:
@@ -247,22 +342,22 @@ class ChatServer:
         finally:
             self.detener()
     
-    def seleccionar_escenario_diffie_hellman(self):
+    def seleccionar_combinación_diffie_hellman(self):
         """Selecciona el escenario para Diffie-Hellman."""
         try:
-            num = int(input("Ingrese el número del escenario Diffie-Hellman (1 a 5): "))
+            num = int(input("Ingrese la combinación de parametros que desea Diffie-Hellman (1 a 5): "))
             if 1 <= num <= 5:
-                self.escenario_seleccionado = num - 1
+                self.modo = num - 1
                 print(f"Usando escenario {num}:")
-                print(f"p = {self.p[self.escenario_seleccionado]}")
-                print(f"q = {self.q[self.escenario_seleccionado]}")
-                print(f"g = {self.g[self.escenario_seleccionado]}")
+                print(f"p = {self.p[self.modo]}")
+                print(f"q = {self.q[self.modo]}")
+                print(f"g = {self.g[self.modo]}")
             else:
                 print("Número fuera de rango. Usando escenario 1 por defecto.")
-                self.escenario_seleccionado = 0
+                self.modo = 0
         except ValueError:
             print("Entrada inválida. Usando escenario 1 por defecto.")
-            self.escenario_seleccionado = 0
+            self.modo = 0
     
     def leer_parametros_json(self, ruta_archivo="parameters.json"):
         """Lee y retorna los parámetros desde el archivo JSON."""
@@ -302,49 +397,96 @@ class ChatServer:
     
     def realizar_intercambio_diffie_hellman(self, cliente_socket, direccion):
         """Realiza el intercambio de claves Diffie-Hellman con un cliente, por turnos."""
-        try:
-            # Usar los parámetros del escenario seleccionado
-            p = self.p[self.escenario_seleccionado]
-            q = self.q[self.escenario_seleccionado]
-            g = self.g[self.escenario_seleccionado]
-            
-            # 1. Enviar al cliente el escenario seleccionado
-            cliente_socket.send(f"ESCENARIO:{self.escenario_seleccionado+1}".encode('utf-8'))
-            print(f"Enviado escenario {self.escenario_seleccionado+1} al cliente")
-            
-            # 2. Generar clave privada del servidor
-            a = random.randint(2, q - 1)
-            
-            # 3. Calcular y enviar clave pública del servidor
-            V = pow(g, a, p)
-            cliente_socket.send(f"V:{V}".encode('utf-8'))
-            print(f"Enviada clave pública V={V} al cliente")
-            
-            # 4. Recibir clave pública del cliente
-            mensaje_cliente = cliente_socket.recv(1024).decode('utf-8')
-            
-            # 5. Procesar respuesta del cliente
-            if mensaje_cliente.startswith("U:"):
-                U = int(mensaje_cliente.split(":")[1].strip())
-                print(f"Recibida clave pública U={U} del cliente")
+        if self.escenario_seleccionado == 1:
+            try:
+                # Usar los parámetros del escenario seleccionado
+                p = self.p[self.modo]
+                q = self.q[self.modo]
+                g = self.g[self.modo]
                 
-                # 6. Calcular el secreto compartido
-                secreto = pow(U, a, p)
-                print(f"Calculado secreto compartido: {secreto}")
+                # 1. Enviar al cliente el escenario seleccionado
+                cliente_socket.send(f"Modo:{self.modo}".encode('utf-8'))
+                print(f"Enviado modo {self.modo} al cliente")
                 
-                # 7. Enviar confirmación
-                cliente_socket.send("DH-OK:Intercambio completado".encode('utf-8'))
+                # 2. Generar clave privada del servidor
+                a = random.randint(2, q - 1) #generar alpha 
                 
-                # Guardar el secreto para este cliente
-                self.secreto_compartido = secreto
-                return secreto
-            else:
-                print(f"Respuesta inesperada del cliente: {mensaje_cliente}")
+                # 3. Calcular y enviar clave pública del servidor
+                U = pow(g, a, p)
+                cliente_socket.send(f"U:{U}".encode('utf-8'))
+                print(f"Enviada clave pública U={U} al cliente")
+                
+                # 4. Recibir clave pública del cliente
+                mensaje_cliente = cliente_socket.recv(1024).decode('utf-8')
+                
+                # 5. Procesar respuesta del cliente
+                if mensaje_cliente.startswith("V:"):
+                    V = int(mensaje_cliente.split(":")[1].strip())
+                    print(f"Recibida clave pública V={V} del cliente")
+                    
+                    # 6. Calcular el secreto compartido
+                    secreto = pow(V, a, p)
+                    print(f"Calculado secreto compartido: {secreto}")
+                    
+                    # 7. Enviar confirmación
+                    cliente_socket.send("DH-OK:Intercambio completado".encode('utf-8'))
+                    
+                    # Guardar el secreto para este cliente
+                    self.secreto_compartido = secreto
+                    return secreto
+                else:
+                    print(f"Respuesta inesperada del cliente: {mensaje_cliente}")
+                    return None        
+            except Exception as e:
+                print(f"Error en intercambio Diffie-Hellman con {direccion}: {e}")
+                return 
+            
+
+        elif self.escenario_seleccionado == 2:
+            try: 
+                p = 2**256 - 2**224 + 2**192 + 2**96 - 1
+                q = 2**256 - 2**224 + 2**192 - 89188191075325690597107910205041859247
+                a = -3
+                b = 41058363725152142129326129780047268409114441015993725554835256314039467401291
+                x = 48439561293906451759052585252797914202762949526041747995844080717082404635286
+                y = 36134250956749795798585127919587881956611106672985015071877198253568414405109
+                G = (x, y)
+                if self.is_point_on_curve(x, y, a, b, p):
+                    print("✅El punto G pertenece a la curva P-256.")
+                else:
+                    return
+                alpha = random.randint(2, q - 1)  
+                U = scalar_multiply(alpha, G, a, p) 
+                cliente_socket.send(f"U:{U}".encode('utf-8'))
+                print(f"Enviada clave pública U={U} al cliente")
+                
+                # 4. Recibir clave pública del cliente
+                mensaje_cliente = cliente_socket.recv(1024).decode('utf-8')
+                
+                # 5. Procesar respuesta del cliente
+                if mensaje_cliente.startswith("V:"):
+                    # Parse the point as a tuple using eval
+                    V_str = mensaje_cliente.split(":")[1].strip()
+                    V = eval(V_str)  # Convert string representation to tuple
+                    print(f"Recibida clave pública V={V} del cliente")
+                    secreto = scalar_multiply(alpha, V, a, p)
+                    print(f"Calculado secreto compartido: {secreto}")
+                    
+                    # 7. Enviar confirmación
+                    cliente_socket.send("DH-OK:Intercambio completado".encode('utf-8'))
+                    
+                    # Guardar el secreto para este cliente
+                    self.secreto_compartido = secreto
+                    return secreto
+                
+            except Exception as e:
+                print(f"Error en escenario 2: {e}")
                 return None
-                
-        except Exception as e:
-            print(f"Error en intercambio Diffie-Hellman con {direccion}: {e}")
-            return None
+    
+    def is_point_on_curve(self, x, y, a, b, p):
+        """Verifica si un punto (x,y) pertenece a la curva elíptica y² = x³ + ax + b (mod p)"""
+        return (y**2 - (x**3 + a*x + b)) % p == 0
+
     
     def detener(self):
         """Detiene el servidor y limpia todos los recursos."""
@@ -359,6 +501,64 @@ class ChatServer:
             
         print("Servidor cerrado")
 
+def point_addition(P, Q, a_curve, p):
+    """Add two points on an elliptic curve"""
+    if P is None: return Q
+    if Q is None: return P
+    
+    x1, y1 = P
+    x2, y2 = Q
+    
+    # If points are the same, use point doubling
+    if x1 == x2 and y1 == y2:
+        return point_doubling(P, a_curve, p)
+    
+    # If points are inverses, return infinity
+    if x1 == x2 and (y1 + y2) % p == 0:
+        return None
+    
+    # Calculate slope
+    x_diff = (x2 - x1) % p
+    x_diff_inv = pow(x_diff, p - 2, p)  # Modular inverse
+    slope = ((y2 - y1) * x_diff_inv) % p
+    
+    # Calculate new point
+    x3 = (slope**2 - x1 - x2) % p
+    y3 = (slope * (x1 - x3) - y1) % p
+    
+    return (x3, y3)
+
+def point_doubling(P, a_curve, p):
+    """Double a point on an elliptic curve"""
+    if P is None: return None
+    
+    x, y = P
+    if y == 0: return None
+    
+    # Calculate slope of tangent line
+    numerator = (3 * x**2 + a_curve) % p
+    denominator = (2 * y) % p
+    denominator_inv = pow(denominator, p - 2, p)
+    slope = (numerator * denominator_inv) % p
+    
+    # Calculate new point
+    x3 = (slope**2 - 2*x) % p
+    y3 = (slope * (x - x3) - y) % p
+    
+    return (x3, y3)
+
+def scalar_multiply(alpha, P, a_curve, p):
+    """Multiply point P by scalar k using double-and-add algorithm"""
+    result = None  # Point at infinity
+    addend = P
+    
+    while alpha > 0:
+        if alpha & 1:  # If bit is set
+            result = point_addition(result, addend, a_curve, p)
+        addend = point_doubling(addend, a_curve, p)
+        alpha >>= 1
+    
+    return result
 
 # Bloque principal
 if __name__ == "__main__":

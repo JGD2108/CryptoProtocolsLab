@@ -14,7 +14,7 @@ class DiffieHellmanAttacker:
         self.g = None
         self.V = None  # Clave pública del servidor
         self.U = None  # Clave pública del cliente
-        self.escenario = None
+        self.modo = None
         self.secret = None
         self.salt = None
         self.key = None  # Clave simétrica derivada
@@ -62,20 +62,20 @@ class DiffieHellmanAttacker:
                         payload = bytes.fromhex(packet.tcp.payload.replace(':', '')).decode('utf-8', errors='ignore')
                         
                         # Buscar información relevante
-                        if payload.startswith("MODO:1"):
+                        if payload.startswith("Escenario:1"):
                             print("PCAP: Modo de comunicación = Diffie-Hellman")
                         
-                        elif payload.startswith("ESCENARIO:"):
+                        elif payload.startswith("Modo:"):
                             #Despues de los 2 puntos, está el numero del escenario
-                            self.escenario = int(payload.split(":")[1].strip())
-                            print(self.escenario)
-                            self.load_parameters(self.escenario)
+                            self.modo = int(payload.split(":")[1].strip())
+                            print(self.modo)
+                            self.load_parameters(self.modo)
                         
-                        elif payload.startswith("V:"):
+                        elif payload.startswith("U:"):
                             self.V = int(payload.split(":")[1].strip())
                             print(f"PCAP: Clave pública del servidor V={self.V}")
                         
-                        elif payload.startswith("U:"):
+                        elif payload.startswith("V:"):
                             self.U = int(payload.split(":")[1].strip())
                             print(f"PCAP: Clave pública del cliente U={self.U}")
                         

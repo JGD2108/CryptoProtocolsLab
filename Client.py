@@ -7,6 +7,9 @@ import json
 from Cryptodome.Cipher import ChaCha20
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+from Cryptodome.Cipher import AES
+from Cryptodome.Util.Padding import pad
+from Cryptodome.Util.Padding import unpad
 
 class ChatClient:
     def __init__(self, host='localhost', port=8888):
@@ -20,10 +23,36 @@ class ChatClient:
         self.p = []
         self.g = []
         self.q = []
-        self.escenario_seleccionado = 0
-        self.modo_comunicacion = 1  # Por defecto Diffie-Hellman
+        self.escenario_seleccionado = None
+        self.modo_comunicacion = None 
         self.secreto_compartido = None
         self.key = None
+        self.HEADER = 64
+        self.FORMAT = 'utf-8'
+    
+    def send_bytes(self, data):
+        """Enviar bytes sin formatear al servidor."""
+        msg_length = len(data)
+        send_length = str(msg_length).encode(self.FORMAT)
+        send_length += b' ' * (self.HEADER - len(send_length))
+        self.socket.send(send_length)
+        self.socket.send(data)
+
+    # Modifica el método de envío de mensajes para el escenario 2
+    def enviar_mensaje(self, mensaje):
+        """Envía un mensaje al servidor."""
+        try:
+            if self.escenario_seleccionado == 1:
+                # Cifrar con ChaCha20
+                mensaje_cifrado = self.encypherChacha20(self.key, mensaje)
+                self.socket.send(mensaje_cifrado)
+            elif self.escenario_seleccionado == 2:
+                # Cifrar con AES192
+                mensaje_cifrado = self.cipherAES192(self.key, mensaje)
+                self.send_bytes(mensaje_cifrado)
+            # ... otros escenarios
+        except Exception as e:
+            print(f"Error al enviar mensaje: {e}")
     
     def conectar(self):
         """Establece conexión con el servidor."""
@@ -33,11 +62,11 @@ class ChatClient:
             self.conectado = True
             print(f"Conectado al servidor en {self.host}:{self.port}")
             
-            # Recibir el modo de comunicación del servidor
+            # Recibir el Escenario del servidor
             modo_msg = self.socket.recv(1024).decode('utf-8')
-            if modo_msg.startswith("MODO:"):
-                self.modo_comunicacion = int(modo_msg.split(":")[1])
-                print(f"Usando modo de comunicación {self.modo_comunicacion}")
+            if modo_msg.startswith("Escenario:"):
+                self.escenario_seleccionado = int(modo_msg.split(":")[1])
+                print(f"Usando modo de comunicación {self.escenario_seleccionado}")
             else:
                 print(f"Mensaje inesperado del servidor: {modo_msg}")
                 self.desconectar()
@@ -59,14 +88,14 @@ class ChatClient:
                     self.conectado = False
                     break
                 
-                if self.modo_comunicacion==1:
+                if self.escenario_seleccionado==1:
                     try:
                         mensaje = self.decipherChacha20(self.key, mensaje)
                     except Exception as e:
                         print(f"\nError al descifrar: {e}")
                         mensaje = mensaje.decode('utf-8', errors='ignore')
                 else:
-                    mensaje = mensaje.decode('utf-8')
+                    mensaje = self.decipherAES192(self.key, mensaje)
                 
                 # Borrar la línea actual del prompt (si hay)
                 print("\r", end="")
@@ -82,16 +111,28 @@ class ChatClient:
             
     def KDF(self, secreto, salt):
         secreto = str(secreto).encode('utf-8')
-        kdf = Argon2id(
-            salt=salt,
-            length=32,
-            iterations=1,
-            lanes=4,
-            memory_cost=64 * 1024,
-            ad=None,
-            secret=None,
-        )
-        key = kdf.derive(secreto)
+        if self.escenario_seleccionado==1:
+            kdf = Argon2id(
+                salt=salt,
+                length=32,
+                iterations=1,
+                lanes=4,
+                memory_cost=64 * 1024,
+                ad=None,
+                secret=None,
+            )
+            key = kdf.derive(secreto)
+        elif self.escenario_seleccionado==2:
+            kdf = Argon2id(
+                salt=salt,
+                length=24,
+                iterations=1,
+                lanes=4,
+                memory_cost=64 * 1024,
+                ad=None,
+                secret=None,
+            )
+            key = kdf.derive(secreto)
         return key
     
     def enviar_mensajes(self):
@@ -104,8 +145,10 @@ class ChatClient:
                 if mensaje.lower() == 'salir':
                     self.conectado = False
                     break
-                if self.modo_comunicacion==1:
+                if self.escenario_seleccionado==1:
                     mensaje = self.encypherChacha20(self.key, mensaje)
+                elif self.escenario_seleccionado==2:
+                    mensaje = self.cipherAES192(self.key, mensaje)
 
                 self.socket.send(mensaje)
                 
@@ -136,6 +179,25 @@ class ChatClient:
             print("Incorrect decryption")
         return plaintext.decode('utf-8')
     
+    def cipherAES192(self, key, data):
+        cipher = AES.new(key, AES.MODE_CBC)
+        ct_bytes = cipher.encrypt(pad(data, AES.block_size))
+        iv = b64encode(cipher.iv).decode('utf-8')
+        ct = b64encode(ct_bytes).decode('utf-8')
+        result = json.dumps({'iv':iv, 'ciphertext':ct})
+        return result.encode('utf-8')
+
+    def decipherAES192(self, key, json_input):
+        try:
+            b64 = json.loads(json_input)
+            iv = b64decode(b64['iv'])
+            ct = b64decode(b64['ciphertext'])
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            pt = unpad(cipher.decrypt(ct), AES.block_size)
+            print("The message was: ", pt)
+            return pt.decode('utf-8')
+        except (ValueError, KeyError):
+            print("Incorrect decryption")
     def iniciar_hilos(self):
         """Inicia los hilos de envío y recepción."""
         # Crear los dos hilos
@@ -171,7 +233,7 @@ class ChatClient:
         # Luego conectar y recibir el modo de comunicación
         if self.conectar():
             # Manejar según el modo de comunicación
-            if self.modo_comunicacion == 1:
+            if self.escenario_seleccionado == 1:
                 # Modo 1: Diffie-Hellman
                 if self.realizar_intercambio_diffie_hellman():
                     print(f"Intercambio Diffie-Hellman completado. Secreto compartido: {self.secreto_compartido}")
@@ -192,27 +254,31 @@ class ChatClient:
                     print("Fallo en el intercambio Diffie-Hellman. Terminando.")
                     self.desconectar()
             
-            elif self.modo_comunicacion == 2:
-                # Modo 2: Placeholder para otro protocolo
-                print("Usando modo de comunicación 2")
-                self.manejar_modo_comunicacion_2()
+            elif self.escenario_seleccionado == 2:
+                if self.realizar_intercambio_diffie_hellman():
+                    print(self.secreto_compartido)
+                    print(f"Intercambio Diffie-Hellman completado. Secreto compartido: {self.secreto_compartido}")
+                    # recibir salt del servidor 
+                    salt_msg = self.socket.recv(1024).decode('utf-8')
+                    if salt_msg.startswith("SAL:"):
+                        salt_b64 = salt_msg.split(":")[1]
+                        salt = b64decode(salt_b64)
+                        print("Salt recibido del servidor")
+                        self.key = self.KDF(self.secreto_compartido[0], salt)
+                    else:
+                        print(f"Error: mensaje inesperado en lugar de salt: {salt_msg}")
+                    
+                    # Solo después de DH exitoso, iniciar hilos de chat
+                    self.iniciar_hilos()
+                    self.esperar_finalizacion()
             
             elif self.modo_comunicacion == 3:
-                # Modo 3: Placeholder para otro protocolo
-                print("Usando modo de comunicación 3")
-                self.manejar_modo_comunicacion_3()
+                pass
             
             else:
                 print(f"Modo de comunicación desconocido: {self.modo_comunicacion}")
                 self.desconectar()
-    
-    def manejar_modo_comunicacion_2(self):
-        """Maneja el segundo modo de comunicación (placeholder)."""
-        pass  # Implementar el segundo modo de comunicación aquí
-    
-    def manejar_modo_comunicacion_3(self):
-        """Maneja el tercer modo de comunicación (placeholder)."""
-        pass  # Implementar el tercer modo de comunicación aquí
+
     
     def leer_parametros_json(self, ruta_archivo="parameters.json"):
         """Lee y retorna los parámetros desde el archivo JSON."""
@@ -252,61 +318,171 @@ class ChatClient:
     
     def realizar_intercambio_diffie_hellman(self):
         """Realiza el intercambio de claves Diffie-Hellman con el servidor, por turnos."""
-        try:
-            # 1. Recibir el escenario seleccionado por el servidor
-            mensaje_escenario = self.socket.recv(1024).decode('utf-8')
-            
-            if mensaje_escenario.startswith("ESCENARIO:"):
-                self.escenario_seleccionado = int(mensaje_escenario.split(":")[1]) - 1
-                print(f"Usando escenario {self.escenario_seleccionado+1} seleccionado por el servidor")
-                print(f"p = {self.p[self.escenario_seleccionado]}")
-                print(f"q = {self.q[self.escenario_seleccionado]}")
-                print(f"g = {self.g[self.escenario_seleccionado]}")
-            else:
-                print(f"Respuesta inesperada del servidor: {mensaje_escenario}")
-                return False
-            
-            # 2. Recibir la clave pública V del servidor
-            mensaje_v = self.socket.recv(1024).decode('utf-8')
-            
-            if mensaje_v.startswith("V:"):
-                V = int(mensaje_v.split(":")[1].strip())
-                print(f"Recibida clave pública V={V} del servidor")
-            else:
-                print(f"Respuesta inesperada del servidor: {mensaje_v}")
-                return False
-            
-            # 3. Generar clave privada
-            p = self.p[self.escenario_seleccionado]
-            q = self.q[self.escenario_seleccionado]
-            g = self.g[self.escenario_seleccionado]
-            a = random.randint(2, q - 1)
-            
-            # 4. Calcular y enviar clave pública
-            U = pow(g, a, p)
-            self.socket.send(f"U:{U}".encode('utf-8'))
-            print(f"Enviada clave pública U={U} al servidor")
-            
-            # 5. Calcular secreto compartido
-            secreto = pow(V, a, p)
-            self.secreto_compartido = secreto
-            
-            # 6. Recibir confirmación
-            confirmacion = self.socket.recv(1024).decode('utf-8')
-            print(f"Confirmación del servidor: {confirmacion}")
-            
-            if confirmacion.startswith("DH-OK:"):
-                return True
-            else:
-                print("No se recibió confirmación adecuada")
-                return False
+        if self.escenario_seleccionado == 1:
+            try:
+                # 1. Recibir el escenario seleccionado por el servidor
+                mensaje_escenario = self.socket.recv(1024).decode('utf-8')
                 
-        except Exception as e:
-            print(f"Error en intercambio Diffie-Hellman: {e}")
-            return False
+                if mensaje_escenario.startswith("MODO:"):
+                    self.MODO = int(mensaje_escenario.split(":")[1])
+                    print(f"Usando escenario {self.modo_comunicacion+1} seleccionado por el servidor")
+                    print(f"p = {self.p[self.modo_comunicacion]}")
+                    print(f"q = {self.q[self.modo_comunicacion]}")
+                    print(f"g = {self.g[self.nodo_comunicacion]}")
+                else:
+                    print(f"Respuesta inesperada del servidor: {mensaje_escenario}")
+                    return False
+                
+                # 2. Recibir la clave pública V del servidor
+                mensaje_v = self.socket.recv(1024).decode('utf-8')
+                
+                if mensaje_v.startswith("U:"):
+                    U = int(mensaje_v.split(":")[1].strip())
+                    print(f"Recibida clave pública V={U} del servidor")
+                else:
+                    print(f"Respuesta inesperada del servidor: {mensaje_v}")
+                    return False
+                
+                # 3. Generar clave privada
+                p = self.p[self.escenario_seleccionado]
+                q = self.q[self.escenario_seleccionado]
+                g = self.g[self.escenario_seleccionado]
+                a = random.randint(2, q - 1)
+                
+                # 4. Calcular y enviar clave pública
+                V = pow(g, a, p)
+                self.socket.send(f"V:{V}".encode('utf-8'))
+                print(f"Enviada clave pública V={V} al servidor")
+                
+                # 5. Calcular secreto compartido
+                secreto = pow(U, a, p)
+                self.secreto_compartido = secreto
+                
+                # 6. Recibir confirmación
+                confirmacion = self.socket.recv(1024).decode('utf-8')
+                print(f"Confirmación del servidor: {confirmacion}")
+                
+                if confirmacion.startswith("DH-OK:"):
+                    return True
+                else:
+                    print("No se recibió confirmación adecuada")
+                    return False
+                    
+            except Exception as e:
+                print(f"Error en intercambio Diffie-Hellman: {e}")
+                return False
+        elif self.escenario_seleccionado == 2:
+            try:
+                p = 2**256 - 2**224 + 2**192 + 2**96 - 1
+                q = 2**256 - 2**224 + 2**192 - 89188191075325690597107910205041859247
+                a = -3
+                b = 41058363725152142129326129780047268409114441015993725554835256314039467401291
+                x = 48439561293906451759052585252797914202762949526041747995844080717082404635286
+                y = 36134250956749795798585127919587881956611106672985015071877198253568414405109
+                G = (x, y)
+                
+                if self.is_point_on_curve(x, y, a, b, p):
+                    print("✅El punto G pertenece a la curva P-256.")
+                else:
+                    print("❌El punto G NO pertenece a la curva P-256.")
+                    return False
+                    
+                beta = random.randint(2, q - 1)  
+                V = scalar_multiply(beta, G, a, p) 
+                
+                mensaje_servidor = self.socket.recv(1024).decode('utf-8')
+                if mensaje_servidor.startswith("U:"):
+                    # Extract the point as a string and convert to tuple
+                    U_str = mensaje_servidor.split(":")[1].strip()
+                    U = eval(U_str)  # Convert string representation to tuple
+                    print(f"Recibida clave pública U={U} del servidor")
+                    
+                    # Calculate shared secret
+                    self.secreto_compartido = scalar_multiply(beta, U, a, p)
+                    print(f"Calculado secreto compartido: {self.secreto_compartido}")
+                    
+                    # Send our public key
+                    self.socket.send(f"V:{V}".encode('utf-8'))
+                    print(f"Enviada clave pública V={V} al servidor")
+                    
+                    # Wait for confirmation
+                    confirmacion = self.socket.recv(1024).decode('utf-8')
+                    if confirmacion.startswith("DH-OK:"):
+                        return True
+                    else:
+                        print(f"Confirmación incorrecta: {confirmacion}")
+                        return False
+                else:
+                    print(f"Mensaje inesperado del servidor: {mensaje_servidor}")
+                    return False
+            except Exception as e:
+                print(f"Error en intercambio ECDH: {e}")
+                return False
+            
+    def is_point_on_curve(self, x, y, a, b, p):
+        """Verifica si un punto (x,y) pertenece a la curva elíptica y² = x³ + ax + b (mod p)"""
+        return (y**2 - (x**3 + a*x + b)) % p == 0
 
+    
+def point_addition(P, Q, a_curve, p):
+    """Add two points on an elliptic curve"""
+    if P is None: return Q
+    if Q is None: return P
+    
+    x1, y1 = P
+    x2, y2 = Q
+    
+    # If points are the same, use point doubling
+    if x1 == x2 and y1 == y2:
+        return point_doubling(P, a_curve, p)
+    
+    # If points are inverses, return infinity
+    if x1 == x2 and (y1 + y2) % p == 0:
+        return None
+    
+    # Calculate slope
+    x_diff = (x2 - x1) % p
+    x_diff_inv = pow(x_diff, p - 2, p)  # Modular inverse
+    slope = ((y2 - y1) * x_diff_inv) % p
+    
+    # Calculate new point
+    x3 = (slope**2 - x1 - x2) % p
+    y3 = (slope * (x1 - x3) - y1) % p
+    
+    return (x3, y3)
 
-# Bloque principal
+def point_doubling(P, a_curve, p):
+    """Double a point on an elliptic curve"""
+    if P is None: return None
+    
+    x, y = P
+    if y == 0: return None
+    
+    # Calculate slope of tangent line
+    numerator = (3 * x**2 + a_curve) % p
+    denominator = (2 * y) % p
+    denominator_inv = pow(denominator, p - 2, p)
+    slope = (numerator * denominator_inv) % p
+    
+    # Calculate new point
+    x3 = (slope**2 - 2*x) % p
+    y3 = (slope * (x - x3) - y) % p
+    
+    return (x3, y3)
+
+def scalar_multiply(alpha, P, a_curve, p):
+    """Multiply point P by scalar k using double-and-add algorithm"""
+    result = None  # Point at infinity
+    addend = P
+    
+    while alpha > 0:
+        if alpha & 1:  # If bit is set
+            result = point_addition(result, addend, a_curve, p)
+        addend = point_doubling(addend, a_curve, p)
+        alpha >>= 1
+    
+    return result
+
 if __name__ == "__main__": 
     cliente = ChatClient()
     try:
