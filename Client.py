@@ -12,7 +12,7 @@ from Cryptodome.Util.Padding import pad
 from Cryptodome.Util.Padding import unpad
 
 class ChatClient:
-    def __init__(self, host='localhost', port=8888):
+    def __init__(self, host='192.168.1.5', port=8888):
         """Inicializa el cliente de chat."""
         self.host = host
         self.port = port
@@ -81,21 +81,52 @@ class ChatClient:
         """Maneja la recepción de mensajes del servidor."""
         while self.conectado:
             try:
-                # Recibir mensaje del servidor
-                mensaje = self.socket.recv(1024)
-                if not mensaje:
-                    print("Conexión cerrada por el servidor")
-                    self.conectado = False
-                    break
-                
-                if self.escenario_seleccionado==1:
+                if self.escenario_seleccionado == 1:
+                    # Recibir mensaje del servidor usando método tradicional
+                    mensaje_cifrado = self.socket.recv(1024)
+                    if not mensaje_cifrado:
+                        print("Conexión cerrada por el servidor")
+                        self.conectado = False
+                        break
+                    
+                    # Descifrar con ChaCha20
                     try:
-                        mensaje = self.decipherChacha20(self.key, mensaje)
+                        mensaje = self.decipherChacha20(self.key, mensaje_cifrado)
+                        if mensaje is None:
+                            print("\nError al descifrar mensaje del servidor")
+                            continue
                     except Exception as e:
                         print(f"\nError al descifrar: {e}")
-                        mensaje = mensaje.decode('utf-8', errors='ignore')
+                        mensaje = mensaje_cifrado.decode('utf-8', errors='ignore')
+                        
+                elif self.escenario_seleccionado == 2:
+                    # Recibir datos con el protocolo de longitud prefijada
+                    msg_length = self.socket.recv(self.HEADER).decode(self.FORMAT)
+                    if not msg_length:
+                        print("Conexión cerrada por el servidor")
+                        self.conectado = False
+                        break
+                        
+                    msg_length = int(msg_length.strip())
+                    mensaje_cifrado = self.socket.recv(msg_length)
+                    
+                    # Decodificar JSON y descifrar con AES192
+                    try:
+                        mensaje = self.decipherAES192(self.key, mensaje_cifrado)
+                        if mensaje is None:
+                            print("\nError al descifrar mensaje del servidor")
+                            continue
+                    except Exception as e:
+                        print(f"\nError procesando mensaje: {e}")
+                        continue
                 else:
-                    mensaje = self.decipherAES192(self.key, mensaje)
+                    # Fallback para otros escenarios
+                    mensaje_cifrado = self.socket.recv(1024)
+                    if not mensaje_cifrado:
+                        print("Conexión cerrada por el servidor")
+                        self.conectado = False
+                        break
+                    mensaje = mensaje_cifrado.decode('utf-8')
                 
                 # Borrar la línea actual del prompt (si hay)
                 print("\r", end="")
@@ -103,13 +134,17 @@ class ChatClient:
                 print(f"\n>>> Mensaje del servidor: {mensaje}")
                 # Reprompt - volver a mostrar el prompt de entrada
                 print("Escribe un mensaje (o 'salir' para terminar): ", end="", flush=True)
-                
+                    
             except Exception as e:
-                print(f"\nError al recibir: {e}")
+                print(f"\nError al recibir mensaje: {e}")
                 self.conectado = False
                 break
+                
+        print("Conexión con el servidor terminada")
             
     def KDF(self, secreto, salt):
+        if isinstance(secreto, tuple):
+            secreto = secreto[0]
         secreto = str(secreto).encode('utf-8')
         if self.escenario_seleccionado==1:
             kdf = Argon2id(
@@ -145,12 +180,18 @@ class ChatClient:
                 if mensaje.lower() == 'salir':
                     self.conectado = False
                     break
+                    
                 if self.escenario_seleccionado==1:
-                    mensaje = self.encypherChacha20(self.key, mensaje)
+                    # Cifrar con ChaCha20
+                    mensaje_cifrado = self.encypherChacha20(self.key, mensaje)
+                    self.socket.send(mensaje_cifrado)
                 elif self.escenario_seleccionado==2:
-                    mensaje = self.cipherAES192(self.key, mensaje)
-
-                self.socket.send(mensaje)
+                    # Cifrar con AES192
+                    mensaje_cifrado = self.cipherAES192(self.key, mensaje.encode('utf-8'))
+                    self.send_bytes(mensaje_cifrado)
+                else:
+                    # Default case - send as plain text
+                    self.socket.send(mensaje.encode('utf-8'))
                 
             except Exception as e:
                 print(f"Error al enviar: {e}")
@@ -180,6 +221,9 @@ class ChatClient:
         return plaintext.decode('utf-8')
     
     def cipherAES192(self, key, data):
+        # Ensure data is bytes
+        if isinstance(data, str):
+            data = data.encode('utf-8')
         cipher = AES.new(key, AES.MODE_CBC)
         ct_bytes = cipher.encrypt(pad(data, AES.block_size))
         iv = b64encode(cipher.iv).decode('utf-8')
@@ -264,7 +308,7 @@ class ChatClient:
                         salt_b64 = salt_msg.split(":")[1]
                         salt = b64decode(salt_b64)
                         print("Salt recibido del servidor")
-                        self.key = self.KDF(self.secreto_compartido[0], salt)
+                        self.key = self.KDF(self.secreto_compartido, salt)
                     else:
                         print(f"Error: mensaje inesperado en lugar de salt: {salt_msg}")
                     
@@ -323,39 +367,39 @@ class ChatClient:
                 # 1. Recibir el escenario seleccionado por el servidor
                 mensaje_escenario = self.socket.recv(1024).decode('utf-8')
                 
-                if mensaje_escenario.startswith("MODO:"):
-                    self.MODO = int(mensaje_escenario.split(":")[1])
-                    print(f"Usando escenario {self.modo_comunicacion+1} seleccionado por el servidor")
-                    print(f"p = {self.p[self.modo_comunicacion]}")
-                    print(f"q = {self.q[self.modo_comunicacion]}")
-                    print(f"g = {self.g[self.nodo_comunicacion]}")
+                if mensaje_escenario.startswith("Modo:"):
+                    self.modo = int(mensaje_escenario.split(":")[1])
+                    print(f"Usando parámetros del escenario {self.modo+1} seleccionado por el servidor")
+                    print(f"p = {self.p[self.modo]}")
+                    print(f"q = {self.q[self.modo]}")
+                    print(f"g = {self.g[self.modo]}")
                 else:
                     print(f"Respuesta inesperada del servidor: {mensaje_escenario}")
                     return False
                 
-                # 2. Recibir la clave pública V del servidor
-                mensaje_v = self.socket.recv(1024).decode('utf-8')
+                # 2. Recibir la clave pública U del servidor
+                mensaje_u = self.socket.recv(1024).decode('utf-8')
                 
-                if mensaje_v.startswith("U:"):
-                    U = int(mensaje_v.split(":")[1].strip())
-                    print(f"Recibida clave pública V={U} del servidor")
+                if mensaje_u.startswith("U:"):
+                    U = int(mensaje_u.split(":")[1].strip())
+                    print(f"Recibida clave pública U={U} del servidor")
                 else:
-                    print(f"Respuesta inesperada del servidor: {mensaje_v}")
+                    print(f"Respuesta inesperada del servidor: {mensaje_u}")
                     return False
                 
                 # 3. Generar clave privada
-                p = self.p[self.escenario_seleccionado]
-                q = self.q[self.escenario_seleccionado]
-                g = self.g[self.escenario_seleccionado]
-                a = random.randint(2, q - 1)
+                p = self.p[self.modo]
+                q = self.q[self.modo]
+                g = self.g[self.modo]
+                b = random.randint(2, q - 1)
                 
                 # 4. Calcular y enviar clave pública
-                V = pow(g, a, p)
+                V = pow(g, b, p)
                 self.socket.send(f"V:{V}".encode('utf-8'))
                 print(f"Enviada clave pública V={V} al servidor")
                 
                 # 5. Calcular secreto compartido
-                secreto = pow(U, a, p)
+                secreto = pow(U, b, p)
                 self.secreto_compartido = secreto
                 
                 # 6. Recibir confirmación
