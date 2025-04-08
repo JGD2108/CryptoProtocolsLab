@@ -12,7 +12,7 @@ from Cryptodome.Util.Padding import pad
 from Cryptodome.Util.Padding import unpad
 
 class ChatClient:
-    def __init__(self, host='192.168.1.5', port=8888):
+    def __init__(self, host='localhost', port=8888):
         """Inicializa el cliente de chat."""
         self.host = host
         self.port = port
@@ -50,7 +50,13 @@ class ChatClient:
                 # Cifrar con AES192
                 mensaje_cifrado = self.cipherAES192(self.key, mensaje)
                 self.send_bytes(mensaje_cifrado)
-            # ... otros escenarios
+            elif self.escenario_seleccionado == 3:
+                # Cifrar con ElGamal
+                mensaje_cifrado = self.cipherGamal(mensaje)
+                self.socket.send(mensaje_cifrado)
+            else:
+                # Default case - send as plain text
+                self.socket.send(mensaje.encode('utf-8'))
         except Exception as e:
             print(f"Error al enviar mensaje: {e}")
     
@@ -119,6 +125,23 @@ class ChatClient:
                     except Exception as e:
                         print(f"\nError procesando mensaje: {e}")
                         continue
+                elif self.escenario_seleccionado == 3:
+                    # Recibir mensaje cifrado con ElGamal
+                    mensaje_cifrado = self.socket.recv(1024)
+                    if not mensaje_cifrado:
+                        print("Conexión cerrada por el servidor")
+                        self.conectado = False
+                        break
+                    
+                    # Descifrar con ElGamal
+                    try:
+                        mensaje = self.decipherGamal(mensaje_cifrado)
+                        if mensaje is None:
+                            print("\nError al descifrar mensaje del servidor")
+                            continue
+                    except Exception as e:
+                        print(f"\nError al descifrar mensaje ElGamal: {e}")
+                        continue
                 else:
                     # Fallback para otros escenarios
                     mensaje_cifrado = self.socket.recv(1024)
@@ -180,19 +203,10 @@ class ChatClient:
                 if mensaje.lower() == 'salir':
                     self.conectado = False
                     break
-                    
-                if self.escenario_seleccionado==1:
-                    # Cifrar con ChaCha20
-                    mensaje_cifrado = self.encypherChacha20(self.key, mensaje)
-                    self.socket.send(mensaje_cifrado)
-                elif self.escenario_seleccionado==2:
-                    # Cifrar con AES192
-                    mensaje_cifrado = self.cipherAES192(self.key, mensaje.encode('utf-8'))
-                    self.send_bytes(mensaje_cifrado)
-                else:
-                    # Default case - send as plain text
-                    self.socket.send(mensaje.encode('utf-8'))
                 
+                # Usar el método enviar_mensaje para cifrar y enviar correctamente
+                self.enviar_mensaje(mensaje)
+                    
             except Exception as e:
                 print(f"Error al enviar: {e}")
                 self.conectado = False
@@ -242,6 +256,43 @@ class ChatClient:
             return pt.decode('utf-8')
         except (ValueError, KeyError):
             print("Incorrect decryption")
+    
+    def cipherGamal(self, mensaje):
+        """Cifra un mensaje usando el esquema ElGamal simplificado."""
+        # Convertir mensaje a entero para operaciones modulares
+        if isinstance(mensaje, str):
+            mensaje_int = int.from_bytes(mensaje.encode('utf-8'), byteorder='big')
+        else:
+            mensaje_int = int.from_bytes(mensaje, byteorder='big')
+            
+        # Realizar cifrado: c = m * k mod p
+        cipher = (mensaje_int * self.key) % self.p[self.modo]
+        return str(cipher).encode('utf-8')
+        
+    def decipherGamal(self, mensaje_cifrado):
+        """Descifra un mensaje usando el esquema ElGamal simplificado."""
+        try:
+            # Convertir mensaje cifrado a entero
+            cipher_int = int(mensaje_cifrado.decode('utf-8'))
+            
+            # Calcular inverso multiplicativo de la clave
+            # k^-1 mod p
+            key_inv = pow(self.key, self.p[self.modo]-2, self.p[self.modo])
+            
+            # Descifrar: m = c * k^-1 mod p
+            plaintext_int = (cipher_int * key_inv) % self.p[self.modo]
+            
+            # Convertir entero a bytes y luego a texto
+            # Determinar cuántos bytes necesitamos
+            byte_length = (plaintext_int.bit_length() + 7) // 8
+            plaintext_bytes = plaintext_int.to_bytes(byte_length, byteorder='big')
+            
+            # Intentar decodificar como UTF-8, con manejo de errores
+            return plaintext_bytes.decode('utf-8', errors='replace')
+        except Exception as e:
+            print(f"Error decifrando mensaje: {e}")
+            return None
+    
     def iniciar_hilos(self):
         """Inicia los hilos de envío y recepción."""
         # Crear los dos hilos
@@ -316,12 +367,23 @@ class ChatClient:
                     self.iniciar_hilos()
                     self.esperar_finalizacion()
             
-            elif self.modo_comunicacion == 3:
-                pass
-            
-            else:
-                print(f"Modo de comunicación desconocido: {self.modo_comunicacion}")
-                self.desconectar()
+            # In the iniciar method, update the section for scenario 3:
+            elif self.escenario_seleccionado == 3:
+                if self.realizar_intercambio_diffie_hellman():
+                    print(f"Intercambio ElGamal completado. Secreto compartido: {self.secreto_compartido}")
+                    # La clave para ElGamal ya está establecida en self.key
+                    self.key = self.secreto_compartido
+                    print("Clave ElGamal establecida correctamente")
+                    
+                    # Iniciar hilos de chat
+                    self.iniciar_hilos()
+                    self.esperar_finalizacion()
+                else:
+                    print("Fallo en el intercambio de claves ElGamal. Terminando.")
+                    self.desconectar()
+        else:
+            print(f"Modo de comunicación desconocido: {self.modo_comunicacion}")
+            self.desconectar()
 
     
     def leer_parametros_json(self, ruta_archivo="parameters.json"):
@@ -407,6 +469,7 @@ class ChatClient:
                 print(f"Confirmación del servidor: {confirmacion}")
                 
                 if confirmacion.startswith("DH-OK:"):
+                    
                     return True
                 else:
                     print("No se recibió confirmación adecuada")
@@ -462,11 +525,79 @@ class ChatClient:
             except Exception as e:
                 print(f"Error en intercambio ECDH: {e}")
                 return False
-            
+        elif self.escenario_seleccionado == 3:
+            try:
+                # Receive setup message from server
+                mensaje_inicial = self.socket.recv(1024).decode('utf-8')
+                print(f"DEBUG: Received raw message: '{mensaje_inicial}'")
+                
+                # Check if we received merged messages (Modo:X and U:Y combined)
+                if "Modo:" in mensaje_inicial and "U:" in mensaje_inicial:
+                    print("Detected merged messages, splitting them...")
+                    
+                    # Extract mode
+                    modo_str = mensaje_inicial.split("Modo:")[1].split("U:")[0].strip()
+                    self.modo = int(modo_str)
+                    print(f"Extracted mode: {self.modo}")
+                    
+                    # Extract U value
+                    U_str = mensaje_inicial.split("U:")[1].strip()
+                    U = int(U_str)
+                    print(f"Extracted server public key U={U}")
+                else:
+                    # Handle standard separate messages
+                    if mensaje_inicial.startswith("Modo:"):
+                        self.modo = int(mensaje_inicial.split(":")[1])
+                        print(f"Using parameters from set {self.modo+1}")
+                        print(f"p = {self.p[self.modo]}")
+                        print(f"q = {self.q[self.modo]}")
+                        print(f"g = {self.g[self.modo]}")
+                        
+                        # Receive U separately
+                        mensaje_u = self.socket.recv(1024).decode('utf-8')
+                        if mensaje_u.startswith("U:"):
+                            U = int(mensaje_u.split(":")[1].strip())
+                            print(f"Received public key U={U} from server")
+                        else:
+                            print(f"Unexpected message format: {mensaje_u}")
+                            return False
+                    else:
+                        print(f"Unexpected message format: {mensaje_inicial}")
+                        return False
+                
+                # Continue with ElGamal - generate our key pair
+                p = self.p[self.modo]
+                q = self.q[self.modo]
+                g = self.g[self.modo]
+                b = random.randint(2, q - 1)
+                
+                # Calculate and send public key
+                V = pow(g, b, p)
+                self.socket.send(f"V:{V}".encode('utf-8'))
+                print(f"Sent public key V={V} to server")
+                
+                # Calculate shared secret
+                secreto = pow(U, b, p)
+                self.secreto_compartido = secreto
+                
+                # Receive confirmation
+                confirmacion = self.socket.recv(1024).decode('utf-8')
+                print(f"Confirmation from server: {confirmacion}")
+                
+                if confirmacion.startswith("DH-OK:"):
+                    return True
+                else:
+                    print("Did not receive proper confirmation")
+                    return False
+            except Exception as e:
+                print(f"Error in ElGamal key exchange: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+               
     def is_point_on_curve(self, x, y, a, b, p):
         """Verifica si un punto (x,y) pertenece a la curva elíptica y² = x³ + ax + b (mod p)"""
         return (y**2 - (x**3 + a*x + b)) % p == 0
-
     
 def point_addition(P, Q, a_curve, p):
     """Add two points on an elliptic curve"""

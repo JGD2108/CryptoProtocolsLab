@@ -1,4 +1,4 @@
- # servidor_oop.py
+# servidor_oop.py
 import socket
 import threading
 import random
@@ -74,7 +74,19 @@ class ChatServer:
                     except Exception as e:
                         print(f"Error procesando mensaje de {direccion}: {e}")
                         continue
-               
+                elif self.escenario_seleccionado == 3:
+                    mensaje_cifrado = cliente_socket.recv(1024)
+                    if not mensaje_cifrado:
+                        break
+                    try:
+                        mensaje = self.decipherGamal(mensaje_cifrado)
+                        if mensaje is None:
+                            print(f"Error al descifrar mensaje de {direccion}")
+                            continue
+                    except Exception as e:
+                        print(f"Error procesando mensaje de {direccion}: {e}")
+                        continue
+                    
                 print(f"Mensaje recibido de {direccion}: {mensaje}")
                
             except Exception as e:
@@ -84,7 +96,8 @@ class ChatServer:
         # Cerrar conexión cuando hay error o el cliente se desconecta
         self.desconectar_cliente(cliente_socket)
         print(f"Cliente {direccion} desconectado")
-   
+    
+    
     def inicializar_socket(self):
         """Configura el socket del servidor."""
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -124,6 +137,9 @@ class ChatServer:
                     send_length = str(msg_length).encode(self.FORMAT)
                     send_length += b' ' * (self.HEADER - len(send_length))
                     cliente.send(send_length)
+                    cliente.send(mensaje_cifrado)
+                else:
+                    mensaje_cifrado = self.cipherGamal(mensaje)
                     cliente.send(mensaje_cifrado)
             except:
                 self.desconectar_cliente(cliente)
@@ -271,15 +287,17 @@ class ChatServer:
                                 args=(cliente_socket, direccion)
                             )
                             hilo_cliente.daemon = True
-                            hilo_cliente.start()
-                       
-
-                       
+                            hilo_cliente.start()                       
                     elif self.escenario_seleccionado == 3:
-                        # Modo 3: Placeholder para otro protocolo
-                        print("Usando modo de comunicación 3")
-                        self.manejar_escenario3(cliente_socket, direccion)
-                       
+                        secreto = self.realizar_intercambio_diffie_hellman(cliente_socket, direccion) 
+                        if secreto:
+                            self.clientes.append(cliente_socket)  # Agregar cliente a la lista
+                            hilo_cliente = threading.Thread(
+                                target=self.recibir_mensajes,   
+                                args=(cliente_socket, direccion)
+                                )
+                            hilo_cliente.daemon = True
+                            hilo_cliente.start()
                     else:
                         print(f"Modo de comunicación desconocido: {self.modo_comunicacion}")
                         cliente_socket.send("ERROR:Modo de comunicación no válido".encode('utf-8'))
@@ -307,7 +325,7 @@ class ChatServer:
                     print(f"Usando Escenario {self.escenario_seleccionado}")
                    
                     # Si es Diffie-Hellman, también seleccionar escenario
-                    if self.escenario_seleccionado == 1:
+                    if self.escenario_seleccionado == 1 or self.escenario_seleccionado == 3:
                         self.seleccionar_combinación_diffie_hellman()
                                     # Inicializar socket y activar servidor
                     self.inicializar_socket()
@@ -340,7 +358,7 @@ class ChatServer:
         try:
             num = int(input("Ingrese la combinación de parametros que desea Diffie-Hellman (1 a 5): "))
             if 1 <= num <= 5:
-                self.modo = num - 1
+                self.modo= num - 1
                 print(f"Usando escenario {num}:")
                 print(f"p = {self.p[self.modo]}")
                 print(f"q = {self.q[self.modo]}")
@@ -387,7 +405,48 @@ class ChatServer:
         else:
             print("No se pudieron cargar los parámetros")
             return False
-   
+    def cipherGamal(self, mensaje):
+        """Cifra un mensaje usando el esquema ElGamal simplificado."""
+        # Convertir mensaje a entero para operaciones modulares
+        if isinstance(mensaje, str):
+            mensaje_int = int.from_bytes(mensaje.encode('utf-8'), byteorder='big')
+        else:
+            mensaje_int = int.from_bytes(mensaje, byteorder='big')
+            
+        # Usar el módulo p correcto para el modo actual
+        p = self.p[self.modo]
+        
+        # Realizar cifrado: c = m * k mod p
+        cipher = (mensaje_int * self.key) % p
+        return str(cipher).encode('utf-8')
+
+    def decipherGamal(self, mensaje_cifrado):
+        """Descifra un mensaje usando el esquema ElGamal simplificado."""
+        try:
+            # Convertir mensaje cifrado a entero
+            cipher_int = int(mensaje_cifrado.decode('utf-8'))
+            
+            # Usar el módulo p correcto para el modo actual
+            p = self.p[self.modo]
+            
+            # Calcular inverso multiplicativo de la clave
+            key_inv = pow(self.key, p-2, p)
+            
+            # Descifrar: m = c * k^-1 mod p
+            plaintext_int = (cipher_int * key_inv) % p
+            
+            # Convertir entero a bytes y luego a texto
+            # Determinar cuántos bytes necesitamos
+            byte_length = (plaintext_int.bit_length() + 7) // 8
+            plaintext_bytes = plaintext_int.to_bytes(byte_length, byteorder='big')
+            
+            # Intentar decodificar como UTF-8, con manejo de errores
+            return plaintext_bytes.decode('utf-8', errors='replace')
+        except Exception as e:
+            print(f"Error decifrando mensaje ElGamal: {e}")
+            return None
+    
+    
     def realizar_intercambio_diffie_hellman(self, cliente_socket, direccion):
         """Realiza el intercambio de claves Diffie-Hellman con un cliente, por turnos."""
         if self.escenario_seleccionado == 1:
@@ -475,6 +534,52 @@ class ChatServer:
             except Exception as e:
                 print(f"Error en escenario 2: {e}")
                 return None
+        elif self.escenario_seleccionado == 3:
+            try:
+                # Use indexed parameters just like scenario 1
+                p = self.p[self.modo]
+                q = self.q[self.modo]
+                g = self.g[self.modo]
+                
+                # 1. Send mode to client
+                cliente_socket.send(f"Modo:{self.modo}".encode('utf-8'))
+                print(f"Enviado modo {self.modo} al cliente")
+                
+                # 2. Generate private key and public key
+                alpha = random.randint(2, q - 1)  # Clave privada
+                U = pow(g, alpha, p)
+                
+                # 3. Send public key to client
+                cliente_socket.send(f"U:{U}".encode('utf-8'))
+                print(f"Enviada clave pública U={U} al cliente")
+                
+                # 4. Receive client's public key
+                mensaje_cliente = cliente_socket.recv(1024).decode('utf-8')
+                
+                # 5. Process client response
+                if mensaje_cliente.startswith("V:"):
+                    V = int(mensaje_cliente.split(":")[1].strip())
+                    print(f"Recibida clave pública V={V} del cliente")
+                    
+                    # 6. Calculate shared secret
+                    secreto = pow(V, alpha, p)
+                    print(f"Calculado secreto compartido: {secreto}")
+                    
+                    # 7. Send confirmation
+                    cliente_socket.send("DH-OK:Intercambio completado".encode('utf-8'))
+                    
+                    # Save the secret for this client
+                    self.secreto_compartido = secreto
+                    self.key = secreto  # Use directly as key for ElGamal
+                    return secreto
+                else:
+                    print(f"Respuesta inesperada del cliente: {mensaje_cliente}")
+                    return None
+            except Exception as e:
+                print(f"Error en intercambio ElGamal con {direccion}: {e}")
+                return None
+            
+            
    
     def is_point_on_curve(self, x, y, a, b, p):
         """Verifica si un punto (x,y) pertenece a la curva elíptica y² = x³ + ax + b (mod p)"""
@@ -552,6 +657,8 @@ def scalar_multiply(alpha, P, a_curve, p):
         alpha >>= 1
    
     return result
+
+
 
 # Bloque principal
 if __name__ == "__main__":
