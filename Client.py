@@ -201,7 +201,14 @@ class ChatClient:
                 mensaje = input("Escribe un mensaje (o 'salir' para terminar): ")
                 
                 if mensaje.lower() == 'salir':
+                    # Improved shutdown sequence
+                    print("Cerrando conexión...")
                     self.conectado = False
+                    # Close socket to interrupt any pending recv() operation
+                    try:
+                        self.socket.shutdown(socket.SHUT_RDWR)
+                    except:
+                        pass  # Socket might already be closed
                     break
                 
                 # Usar el método enviar_mensaje para cifrar y enviar correctamente
