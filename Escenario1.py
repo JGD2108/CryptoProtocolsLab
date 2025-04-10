@@ -34,7 +34,7 @@ class DiffieHellmanAttacker:
                 
             with open("parameters.json", 'r') as f:
                 data = json.load(f)
-                params = data["parameters"][self.escenario-1]
+                params = data["parameters"][self.escenario]
                 self.p = params["p"]
                 self.q = params["q"]
                 self.g = params["g"]
@@ -62,10 +62,10 @@ class DiffieHellmanAttacker:
                         payload = bytes.fromhex(packet.tcp.payload.replace(':', '')).decode('utf-8', errors='ignore')
                         
                         # Buscar información relevante
-                        if payload.startswith("MODO:1"):
+                        if payload.startswith("Escenario:1"):
                             print("PCAP: Modo de comunicación = Diffie-Hellman")
                         
-                        elif payload.startswith("ESCENARIO:"):
+                        elif payload.startswith("Modo:"):
                             #Despues de los 2 puntos, está el numero del escenario
                             self.escenario = int(payload.split(":")[1].strip())
                             print(self.escenario)

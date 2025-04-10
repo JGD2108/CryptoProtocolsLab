@@ -11,6 +11,7 @@ from base64 import b64encode, b64decode
 from Cryptodome.Cipher import AES
 from Cryptodome.Util.Padding import pad
 from Cryptodome.Util.Padding import unpad
+import time
 
 
 
@@ -461,8 +462,8 @@ class ChatServer:
                 print(f"Enviado modo {self.modo} al cliente")
                
                 # 2. Generar clave privada del servidor
-                a = random.randint(2, q - 1) #generar alpha
-               
+                a = random.randint(2, q - 1) #generar alpha 
+                time.sleep(0.1)
                 # 3. Calcular y enviar clave pública del servidor
                 U = pow(g, a, p)
                 cliente_socket.send(f"U:{U}".encode('utf-8'))
@@ -510,6 +511,7 @@ class ChatServer:
                 alpha = random.randint(2, q - 1)  
                 U = scalar_multiply(alpha, G, a, p)
                 cliente_socket.send(f"U:{U}".encode('utf-8'))
+                time.sleep(0.1)
                 print(f"Enviada clave pública U={U} al cliente")
                
                 # 4. Recibir clave pública del cliente
